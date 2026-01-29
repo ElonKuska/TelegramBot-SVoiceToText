@@ -49,10 +49,11 @@ python app.py
 - `POLL_INTERVAL_SECONDS` — частота опроса статуса.
 - `POLL_TIMEOUT_SECONDS` — максимальное время ожидания завершения job.
 - `LOG_LEVEL` — уровень логов (`INFO`, `DEBUG` и т.д.).
+- `OPENAI_API_KEY` — включит режим Summary AI (короткий пересказ).
+- `OPENAI_MODEL` — модель OpenAI для суммаризации (по умолчанию `gpt-4o-mini`).
 
 ## Примечания
 
 - Этот реадме.мд написан фулл вайбкодом и код тоже 
 
 - `FFMPEG_BIN=auto` — будет использован встроенный бинарник из `imageio-ffmpeg`.
-

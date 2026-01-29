@@ -32,6 +32,8 @@ FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1.0"))
 POLL_TIMEOUT_SECONDS = float(os.getenv("POLL_TIMEOUT_SECONDS", "90.0"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
@@ -182,7 +184,6 @@ async def handle_voice(message: Message) -> None:
         status_message = await message.reply("Генерирую расшифровку...")
         await transcribe_and_send(
             file_id=message.voice.file_id,
-            chat_id=message.chat.id,
             status_message=status_message,
             mode="full",
         )
@@ -199,12 +200,43 @@ async def handle_voice(message: Message) -> None:
     await message.reply("Выберите вид:", reply_markup=keyboard)
 
 
-def summarize_text(text: str, max_sentences: int = 2, max_chars: int = 800) -> str:
-    """Very lightweight extractive summary: keep the first few sentences within limits."""
+async def summarize_text(text: str) -> str:
 
-    cleaned = text.strip()
+    cleaned = (text or "").strip()
     if not cleaned:
         return "Текст не распознан."
+
+    if OPENAI_API_KEY:
+        try:
+            prompt = (
+                "Сейчас я тебе дам расшифровку голосового сообщения. "
+                "Тебе нужно кратко описать всю суть сообщения без воды, чтобы было понятно, что требуется."
+            )
+            user_content = f'{prompt}\nСама расшифровка "{cleaned}"'
+            timeout = ClientTimeout(total=20)
+            async with ClientSession(timeout=timeout) as session:
+                resp = await session.post(
+                    "https://api.openai.com/v1/chat/completions",
+                    json={
+                        "model": OPENAI_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "Ты лаконично пересказываешь суть на русском."},
+                            {"role": "user", "content": user_content},
+                        ],
+                        "temperature": 0.2,
+                        "max_tokens": 200,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {OPENAI_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                resp.raise_for_status()
+                payload = await resp.json()
+                choice = payload["choices"][0]["message"]["content"].strip()
+                return choice or "Текст не распознан."
+        except Exception as exc:  # pragma: no cover - network dependent
+            logger.warning("OpenAI summary failed, fallback to local: %s", exc)
 
     sentences: list[str] = []
     current = []
@@ -213,17 +245,15 @@ def summarize_text(text: str, max_sentences: int = 2, max_chars: int = 800) -> s
         if ch in {".", "!", "?"}:
             sentences.append("".join(current).strip())
             current = []
-        if len(sentences) >= max_sentences:
+        if len(sentences) >= 2:
             break
     if not sentences and current:
         sentences.append("".join(current).strip())
-
     summary = " ".join(sentences) if sentences else cleaned
-    summary = summary[:max_chars]
-    return summary or "Текст не распознан."
+    return summary[:800] or "Текст не распознан."
 
 
-async def transcribe_and_send(file_id: str, chat_id: int, status_message: Message, mode: str) -> None:
+async def transcribe_and_send(file_id: str, status_message: Message, mode: str) -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_dir_path = Path(tmp_dir)
@@ -243,10 +273,16 @@ async def transcribe_and_send(file_id: str, chat_id: int, status_message: Messag
 
         transcript = transcript or "Текст не распознан."
         if mode == "summary":
-            transcript = summarize_text(transcript)
-
-        safe_text = transcript.replace("`", "\\`")
-        await status_message.edit_text(f"```\n{safe_text}\n```")
+            summary = await summarize_text(transcript)
+            safe = (
+                summary.replace("`", "\\`")
+                .replace("*", "\\*")
+                .replace("_", "\\_")
+            )
+            await status_message.edit_text(f"🤖Summary AI:\n**{safe}**")
+        else:
+            safe_text = transcript.replace("`", "\\`")
+            await status_message.edit_text(f"```\n{safe_text}\n```")
     except Exception as exc:
         logger.exception("Failed to transcribe voice: %s", exc)
         await status_message.edit_text("Не удалось расшифровать сообщение. Попробуй еще раз позже.")
@@ -272,10 +308,9 @@ async def handle_choice(callback: CallbackQuery) -> None:
         await callback.message.answer("Это голосовое принадлежит другому пользователю. Отправь свое сообщение.")
         return
 
-    status_message = await callback.message.answer("Генерирую расшифровку...")
+    status_message = await callback.message.edit_text("Генерирую расшифровку...")
     await transcribe_and_send(
         file_id=str(payload["file_id"]),
-        chat_id=callback.message.chat.id,
         status_message=status_message,
         mode=mode,
     )
