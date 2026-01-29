@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import subprocess
 import tempfile
 from pathlib import Path
@@ -10,7 +11,12 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from aiohttp import ClientSession, ClientTimeout
 from dotenv import load_dotenv
 import imageio_ffmpeg
@@ -41,6 +47,7 @@ if not SPEECHMATICS_API_KEY:
 bot = Bot(BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
 dp = Dispatcher()
 bot_username_cache: str | None = None
+pending_requests: dict[str, dict[str, int | str]] = {}
 
 
 async def get_bot_username() -> str:
@@ -52,8 +59,8 @@ async def get_bot_username() -> str:
     return bot_username_cache
 
 
-async def download_voice_file(message: Message, dest: Path) -> None:
-    file = await bot.get_file(message.voice.file_id)
+async def download_voice_file(file_id: str, dest: Path) -> None:
+    file = await bot.get_file(file_id)
     await bot.download_file(file.file_path, destination=dest)
 
 
@@ -171,15 +178,59 @@ async def handle_start(message: Message) -> None:
 
 @dp.message(F.voice)
 async def handle_voice(message: Message) -> None:
-    status_message = await message.reply("Генерирую расшифровку...")
+    if message.chat.type in {"group", "supergroup"}:
+        status_message = await message.reply("Генерирую расшифровку...")
+        await transcribe_and_send(
+            file_id=message.voice.file_id,
+            chat_id=message.chat.id,
+            status_message=status_message,
+            mode="full",
+        )
+        return
 
+    request_id = secrets.token_hex(6)
+    pending_requests[request_id] = {"file_id": message.voice.file_id, "user_id": message.from_user.id}
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Полная расшифровка", callback_data=f"tr:full:{request_id}")],
+            [InlineKeyboardButton(text="Summary AI", callback_data=f"tr:summary:{request_id}")],
+        ]
+    )
+    await message.reply("Выберите вид:", reply_markup=keyboard)
+
+
+def summarize_text(text: str, max_sentences: int = 2, max_chars: int = 800) -> str:
+    """Very lightweight extractive summary: keep the first few sentences within limits."""
+
+    cleaned = text.strip()
+    if not cleaned:
+        return "Текст не распознан."
+
+    sentences: list[str] = []
+    current = []
+    for ch in cleaned:
+        current.append(ch)
+        if ch in {".", "!", "?"}:
+            sentences.append("".join(current).strip())
+            current = []
+        if len(sentences) >= max_sentences:
+            break
+    if not sentences and current:
+        sentences.append("".join(current).strip())
+
+    summary = " ".join(sentences) if sentences else cleaned
+    summary = summary[:max_chars]
+    return summary or "Текст не распознан."
+
+
+async def transcribe_and_send(file_id: str, chat_id: int, status_message: Message, mode: str) -> None:
     try:
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_dir_path = Path(tmp_dir)
             ogg_path = tmp_dir_path / "voice.ogg"
             wav_path = tmp_dir_path / "voice.wav"
 
-            await download_voice_file(message, ogg_path)
+            await download_voice_file(file_id, ogg_path)
             convert_to_wav(ogg_path, wav_path)
 
             timeout = ClientTimeout(total=POLL_TIMEOUT_SECONDS + 30)
@@ -191,10 +242,43 @@ async def handle_voice(message: Message) -> None:
                 transcript = await fetch_transcript(session, job_id)
 
         transcript = transcript or "Текст не распознан."
-        await status_message.edit_text(f"```\n{transcript}\n```")
+        if mode == "summary":
+            transcript = summarize_text(transcript)
+
+        safe_text = transcript.replace("`", "\\`")
+        await status_message.edit_text(f"```\n{safe_text}\n```")
     except Exception as exc:
         logger.exception("Failed to transcribe voice: %s", exc)
         await status_message.edit_text("Не удалось расшифровать сообщение. Попробуй еще раз позже.")
+
+
+@dp.callback_query(F.data.startswith("tr:"))
+async def handle_choice(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+    try:
+        _, mode, request_id = callback.data.split(":", 2)
+    except ValueError:
+        await callback.message.edit_text("Не удалось обработать выбор. Отправь голосовое еще раз.")
+        return
+
+    payload = pending_requests.pop(request_id, None)
+    if not payload:
+        await callback.message.edit_text("Запрос устарел. Отправь голосовое еще раз.")
+        return
+
+    expected_user = payload.get("user_id")
+    if expected_user and callback.from_user and callback.from_user.id != expected_user:
+        await callback.message.answer("Это голосовое принадлежит другому пользователю. Отправь свое сообщение.")
+        return
+
+    status_message = await callback.message.answer("Генерирую расшифровку...")
+    await transcribe_and_send(
+        file_id=str(payload["file_id"]),
+        chat_id=callback.message.chat.id,
+        status_message=status_message,
+        mode=mode,
+    )
 
 
 async def main() -> None:
