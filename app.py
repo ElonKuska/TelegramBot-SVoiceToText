@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import secrets
@@ -7,7 +6,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import aiohttp
+from openai import AsyncOpenAI
+from openai import OpenAIError
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
@@ -17,7 +17,6 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from aiohttp import ClientSession, ClientTimeout
 from dotenv import load_dotenv
 import imageio_ffmpeg
 
@@ -25,15 +24,18 @@ import imageio_ffmpeg
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SPEECHMATICS_API_KEY = os.getenv("SPEECHMATICS_API_KEY")
-SPEECHMATICS_BASE_URL = os.getenv("SPEECHMATICS_BASE_URL", "https://eu1.asr.api.speechmatics.com/v2")
-SPEECHMATICS_LANGUAGE = os.getenv("SPEECHMATICS_LANGUAGE", "ru")
 FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-POLL_INTERVAL_SECONDS = float(os.getenv("POLL_INTERVAL_SECONDS", "1.0"))
-POLL_TIMEOUT_SECONDS = float(os.getenv("POLL_TIMEOUT_SECONDS", "90.0"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
+OPENAI_TRANSCRIBE_LANGUAGE = os.getenv("OPENAI_TRANSCRIBE_LANGUAGE", "ru").strip()
+OPENAI_ORG = os.getenv("OPENAI_ORG")
+openai_client: AsyncOpenAI | None = None
+SUMMARY_AI_PROMPT = (
+    "Кратко перескажи суть голосового сообщения без ограничений по количеству предложений. "
+    "Убери повторы, эмоции и разговорную воду. Пиши ясно и по делу."
+)
 
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,8 +44,8 @@ logger = logging.getLogger(__name__)
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in the environment or .env file.")
 
-if not SPEECHMATICS_API_KEY:
-    raise RuntimeError("SPEECHMATICS_API_KEY is missing. Set it in the environment or .env file.")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is missing. Set it in the environment or .env file.")
 
 
 bot = Bot(BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
@@ -93,68 +95,33 @@ def convert_to_wav(src: Path, dest: Path) -> None:
         )
 
 
-async def create_job(session: ClientSession, wav_path: Path) -> str:
-    url = f"{SPEECHMATICS_BASE_URL.rstrip('/')}/jobs"
-    config = {
-        "type": "transcription",
-        "transcription_config": {
-            "language": SPEECHMATICS_LANGUAGE,
-        },
+def get_openai_client() -> AsyncOpenAI:
+    global openai_client
+    if openai_client is None:
+        openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, organization=OPENAI_ORG)
+    return openai_client
+
+
+async def transcribe_audio(wav_path: Path, prompt: str | None = None) -> str:
+    request: dict[str, str] = {
+        "model": OPENAI_TRANSCRIBE_MODEL,
     }
-    data = {
-        "config": json.dumps(config),
-    }
-    form = aiohttp.FormData()
-    form.add_field("config", data["config"])
-    form.add_field(
-        "data_file",
-        wav_path.open("rb"),
-        filename=wav_path.name,
-        content_type="audio/wav",
-    )
-    headers = {"Authorization": f"Bearer {SPEECHMATICS_API_KEY}"}
+    if OPENAI_TRANSCRIBE_LANGUAGE:
+        request["language"] = OPENAI_TRANSCRIBE_LANGUAGE
+    if prompt:
+        request["prompt"] = prompt
 
-    async with session.post(url, data=form, headers=headers) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(f"Speechmatics job create failed ({resp.status}): {text}")
-        payload = await resp.json()
-    job_id = payload.get("id") or payload.get("job", {}).get("id")
-    if not job_id:
-        raise RuntimeError(f"Cannot read job id from response: {payload}")
-    return job_id
-
-
-async def wait_for_job_done(session: ClientSession, job_id: str) -> str:
-    url = f"{SPEECHMATICS_BASE_URL.rstrip('/')}/jobs/{job_id}"
-    headers = {"Authorization": f"Bearer {SPEECHMATICS_API_KEY}"}
-    elapsed = 0.0
-
-    while elapsed <= POLL_TIMEOUT_SECONDS:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status >= 400:
-                text = await resp.text()
-                raise RuntimeError(f"Speechmatics job status failed ({resp.status}): {text}")
-            payload = await resp.json()
-        status = payload.get("job", {}).get("status") or payload.get("status")
-        if status in {"done", "rejected", "expired", "deleted"}:
-            return status
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-        elapsed += POLL_INTERVAL_SECONDS
-
-    raise TimeoutError(f"Speechmatics job {job_id} did not finish in {POLL_TIMEOUT_SECONDS}s")
-
-
-async def fetch_transcript(session: ClientSession, job_id: str) -> str:
-    url = f"{SPEECHMATICS_BASE_URL.rstrip('/')}/jobs/{job_id}/transcript"
-    headers = {"Authorization": f"Bearer {SPEECHMATICS_API_KEY}"}
-    params = {"format": "txt"}
-
-    async with session.get(url, headers=headers, params=params) as resp:
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(f"Speechmatics transcript failed ({resp.status}): {text}")
-        return (await resp.text()).strip()
+    with wav_path.open("rb") as audio_file:
+        transcription = await get_openai_client().audio.transcriptions.create(
+            file=audio_file,
+            **request,
+        )
+    text = getattr(transcription, "text", None)
+    if isinstance(text, str):
+        return text.strip()
+    if isinstance(transcription, str):
+        return transcription.strip()
+    raise RuntimeError("Unexpected transcription response format from OpenAI API")
 
 
 def build_start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
@@ -200,43 +167,30 @@ async def handle_voice(message: Message) -> None:
     await message.reply("Выберите вид:", reply_markup=keyboard)
 
 
-async def summarize_text(text: str) -> str:
+async def summarize_text(text: str) -> tuple[str, bool]:
 
     cleaned = (text or "").strip()
     if not cleaned:
-        return "Текст не распознан."
+        return "Текст не распознан.", False
 
-    if OPENAI_API_KEY:
-        try:
-            prompt = (
-                "Сейчас я тебе дам расшифровку голосового сообщения. "
-                "Тебе нужно кратко описать всю суть сообщения без воды, чтобы было понятно, что требуется."
-            )
-            user_content = f'{prompt}\nСама расшифровка "{cleaned}"'
-            timeout = ClientTimeout(total=20)
-            async with ClientSession(timeout=timeout) as session:
-                resp = await session.post(
-                    "https://api.openai.com/v1/chat/completions",
-                    json={
-                        "model": OPENAI_MODEL,
-                        "messages": [
-                            {"role": "system", "content": "Ты лаконично пересказываешь суть на русском."},
-                            {"role": "user", "content": user_content},
-                        ],
-                        "temperature": 0.2,
-                        "max_tokens": 200,
-                    },
-                    headers={
-                        "Authorization": f"Bearer {OPENAI_API_KEY}",
-                        "Content-Type": "application/json",
-                    },
-                )
-                resp.raise_for_status()
-                payload = await resp.json()
-                choice = payload["choices"][0]["message"]["content"].strip()
-                return choice or "Текст не распознан."
-        except Exception as exc:  # pragma: no cover - network dependent
-            logger.warning("OpenAI summary failed, fallback to local: %s", exc)
+    try:
+        user_content = f"{SUMMARY_AI_PROMPT}\n\nРасшифровка:\n{cleaned}"
+
+        completion = await get_openai_client().chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Ты — инструмент для сжатия информации и извлечения сути."},
+                {"role": "user", "content": user_content},
+            ],
+            temperature=0.2,
+            max_completion_tokens=200,
+        )
+        choice = (completion.choices[0].message.content or "").strip()
+        return (choice or "Текст не распознан."), True
+    except OpenAIError as exc:  # pragma: no cover - network dependent
+        logger.warning("OpenAI summary failed, fallback to local: %s", exc)
+    except Exception as exc:  # pragma: no cover - network dependent
+        logger.warning("Unexpected OpenAI error, fallback to local: %s", exc)
 
     sentences: list[str] = []
     current = []
@@ -250,7 +204,7 @@ async def summarize_text(text: str) -> str:
     if not sentences and current:
         sentences.append("".join(current).strip())
     summary = " ".join(sentences) if sentences else cleaned
-    return summary[:800] or "Текст не распознан."
+    return (summary[:800] or "Текст не распознан."), False
 
 
 async def transcribe_and_send(file_id: str, status_message: Message, mode: str) -> None:
@@ -262,24 +216,19 @@ async def transcribe_and_send(file_id: str, status_message: Message, mode: str) 
 
             await download_voice_file(file_id, ogg_path)
             convert_to_wav(ogg_path, wav_path)
-
-            timeout = ClientTimeout(total=POLL_TIMEOUT_SECONDS + 30)
-            async with ClientSession(timeout=timeout) as session:
-                job_id = await create_job(session, wav_path)
-                status = await wait_for_job_done(session, job_id)
-                if status != "done":
-                    raise RuntimeError(f"Job finished with status {status}")
-                transcript = await fetch_transcript(session, job_id)
+            transcribe_prompt = SUMMARY_AI_PROMPT if mode == "summary" else None
+            transcript = await transcribe_audio(wav_path, prompt=transcribe_prompt)
 
         transcript = transcript or "Текст не распознан."
         if mode == "summary":
-            summary = await summarize_text(transcript)
+            summary, used_openai = await summarize_text(transcript)
             safe = (
                 summary.replace("`", "\\`")
                 .replace("*", "\\*")
                 .replace("_", "\\_")
             )
-            await status_message.edit_text(f"🤖Summary AI:\n**{safe}**")
+            suffix = "" if used_openai else "\n_(локальный пересказ, OpenAI недоступен)_"
+            await status_message.edit_text(f"🤖Summary AI:\n**{safe}**{suffix}")
         else:
             safe_text = transcript.replace("`", "\\`")
             await status_message.edit_text(f"```\n{safe_text}\n```")
