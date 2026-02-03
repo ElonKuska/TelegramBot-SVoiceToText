@@ -1,4 +1,4 @@
-# SVoiceToText Telegram Bot (OpenAI Speech-to-Text)
+# SVoiceToText Telegram Bot t.me/SVoiceToTextBot (OpenAI Speech-to-Text)
 
 Бот на aiogram, который расшифровывает голосовые сообщения через OpenAI Audio Transcriptions API и отвечает расшифровкой в том же чате.
 
