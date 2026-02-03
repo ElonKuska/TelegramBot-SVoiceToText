@@ -187,9 +187,9 @@ async def summarize_text(text: str) -> tuple[str, bool]:
         )
         choice = (completion.choices[0].message.content or "").strip()
         return (choice or "Текст не распознан."), True
-    except OpenAIError as exc:  # pragma: no cover - network dependent
+    except OpenAIError as exc: 
         logger.warning("OpenAI summary failed, fallback to local: %s", exc)
-    except Exception as exc:  # pragma: no cover - network dependent
+    except Exception as exc: 
         logger.warning("Unexpected OpenAI error, fallback to local: %s", exc)
 
     sentences: list[str] = []

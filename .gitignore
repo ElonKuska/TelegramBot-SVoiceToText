@@ -1,8 +1,7 @@
-# Virtual environments
+
 .venv/
 venv/
 
-# Python artefacts
 __pycache__/
 *.py[cod]
 *.pyo
@@ -17,11 +16,9 @@ __pycache__/
 dist/
 build/
 
-# Env files
 .env
 .env.local
 
-# Editors / OS
 .vscode/
 .idea/
 .DS_Store
