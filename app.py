@@ -1,15 +1,18 @@
 import asyncio
+import json
 import logging
 import os
 import secrets
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 from openai import AsyncOpenAI
 from openai import OpenAIError
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -31,6 +34,13 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe")
 OPENAI_TRANSCRIBE_LANGUAGE = os.getenv("OPENAI_TRANSCRIBE_LANGUAGE", "ru").strip()
 OPENAI_ORG = os.getenv("OPENAI_ORG")
+PASSWORD = os.getenv("PASSWORD", os.getenv("password", "")).strip()
+WORK_GROUP_RAW = os.getenv("WORK_GROUP", os.getenv("work_group", "true")).strip().lower()
+WORK_GROUP = WORK_GROUP_RAW in {"1", "true", "yes", "on"}
+PASSWORD_ENABLED = bool(PASSWORD)
+PASSWORD_MAX_ATTEMPTS = 5
+PASSWORD_LOCK_SECONDS = 24 * 60 * 60
+AUTH_DB_PATH = Path(os.getenv("AUTH_DB_PATH", "auth_users.json"))
 openai_client: AsyncOpenAI | None = None
 SUMMARY_AI_PROMPT = (
     "Кратко перескажи суть голосового сообщения без ограничений по количеству предложений. "
@@ -52,6 +62,194 @@ bot = Bot(BOT_TOKEN, parse_mode=ParseMode.MARKDOWN)
 dp = Dispatcher()
 bot_username_cache: str | None = None
 pending_requests: dict[str, dict[str, int | str]] = {}
+password_prompt_messages: dict[int, int] = {}
+auth_db_lock = asyncio.Lock()
+
+
+def load_auth_db() -> tuple[set[int], dict[int, dict[str, float]]]:
+    if not AUTH_DB_PATH.exists():
+        return set(), {}
+    try:
+        payload = json.loads(AUTH_DB_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to read auth db, starting fresh: %s", exc)
+        return set(), {}
+
+    raw_users = payload.get("authorized_users", [])
+    raw_attempts = payload.get("failed_attempts", {})
+    authorized_users: set[int] = set()
+    failed_attempts: dict[int, dict[str, float]] = {}
+
+    if isinstance(raw_users, list):
+        for value in raw_users:
+            try:
+                authorized_users.add(int(value))
+            except (TypeError, ValueError):
+                continue
+
+    if isinstance(raw_attempts, dict):
+        for key, value in raw_attempts.items():
+            try:
+                user_id = int(key)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            count = int(value.get("count", 0))
+            locked_until = float(value.get("locked_until", 0))
+            failed_attempts[user_id] = {"count": float(count), "locked_until": locked_until}
+
+    return authorized_users, failed_attempts
+
+
+authorized_users, failed_attempts = load_auth_db()
+
+
+def save_auth_db() -> None:
+    payload = {
+        "authorized_users": sorted(authorized_users),
+        "failed_attempts": {
+            str(user_id): {
+                "count": int(data.get("count", 0)),
+                "locked_until": float(data.get("locked_until", 0)),
+            }
+            for user_id, data in failed_attempts.items()
+        },
+    }
+    AUTH_DB_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def remaining_attempts_from_count(count: int) -> int:
+    return max(0, PASSWORD_MAX_ATTEMPTS - count)
+
+
+async def get_user_status(user_id: int) -> tuple[bool, bool, int]:
+    async with auth_db_lock:
+        if user_id in authorized_users:
+            return True, False, PASSWORD_MAX_ATTEMPTS
+
+        entry = failed_attempts.get(user_id)
+        if not entry:
+            return False, False, PASSWORD_MAX_ATTEMPTS
+
+        now_ts = time.time()
+        locked_until = float(entry.get("locked_until", 0))
+        if locked_until > now_ts:
+            return False, True, 0
+
+        if locked_until and locked_until <= now_ts:
+            failed_attempts.pop(user_id, None)
+            save_auth_db()
+            return False, False, PASSWORD_MAX_ATTEMPTS
+
+        count = int(entry.get("count", 0))
+        return False, False, remaining_attempts_from_count(count)
+
+
+async def register_failed_password(user_id: int) -> tuple[int, bool]:
+    async with auth_db_lock:
+        now_ts = time.time()
+        entry = failed_attempts.get(user_id, {"count": 0.0, "locked_until": 0.0})
+
+        locked_until = float(entry.get("locked_until", 0))
+        if locked_until and locked_until <= now_ts:
+            entry = {"count": 0.0, "locked_until": 0.0}
+
+        count = int(entry.get("count", 0)) + 1
+        locked = count >= PASSWORD_MAX_ATTEMPTS
+        next_locked_until = now_ts + PASSWORD_LOCK_SECONDS if locked else 0.0
+        failed_attempts[user_id] = {"count": float(count), "locked_until": next_locked_until}
+        save_auth_db()
+        return remaining_attempts_from_count(count), locked
+
+
+async def mark_user_authorized(user_id: int) -> None:
+    async with auth_db_lock:
+        authorized_users.add(user_id)
+        failed_attempts.pop(user_id, None)
+        save_auth_db()
+
+
+async def delete_message_safely(chat_id: int, message_id: int) -> None:
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except TelegramBadRequest:
+        return
+
+
+async def send_welcome_message(chat_id: int) -> None:
+    bot_username = await get_bot_username()
+    keyboard = build_start_keyboard(bot_username)
+    await bot.send_message(
+        chat_id,
+        "Привет, это бот который голосовые сообщения переводит в текстовый вариант.\n"
+        "Просто перешли любое голосовое сообщение, например от друга, и я его расшифрую!\n"
+        "Меня также можно добавить в группы!",
+        reply_markup=keyboard,
+    )
+
+
+async def show_password_prompt(chat_id: int, user_id: int, text: str) -> None:
+    previous_prompt_id = password_prompt_messages.pop(user_id, None)
+    if previous_prompt_id:
+        await delete_message_safely(chat_id=chat_id, message_id=previous_prompt_id)
+    prompt = await bot.send_message(chat_id, text)
+    password_prompt_messages[user_id] = prompt.message_id
+
+
+async def ensure_user_access(message: Message) -> bool:
+    if message.chat.type in {"group", "supergroup"} and not WORK_GROUP:
+        return False
+
+    if not PASSWORD_ENABLED:
+        return True
+
+    user = message.from_user
+    if not user:
+        return False
+
+    user_id = user.id
+    is_authorized, is_locked, remaining = await get_user_status(user_id)
+    if is_authorized:
+        return True
+    if is_locked:
+        return False
+
+    # Пароль спрашиваем в личке, в группах для неавторизованных пользователей просто молчим.
+    if message.chat.type != "private":
+        return False
+
+    text = (message.text or "").strip()
+    has_prompt = user_id in password_prompt_messages
+
+    if not has_prompt or text.startswith("/"):
+        await show_password_prompt(
+            chat_id=message.chat.id,
+            user_id=user_id,
+            text=f"Введите пароль (осталось {remaining} попыток):",
+        )
+        return False
+
+    await delete_message_safely(chat_id=message.chat.id, message_id=message.message_id)
+    previous_prompt_id = password_prompt_messages.pop(user_id, None)
+    if previous_prompt_id:
+        await delete_message_safely(chat_id=message.chat.id, message_id=previous_prompt_id)
+
+    if text == PASSWORD:
+        await mark_user_authorized(user_id)
+        await bot.send_message(message.chat.id, "Пароль верный.")
+        await send_welcome_message(message.chat.id)
+        return False
+
+    remaining_after_try, locked = await register_failed_password(user_id)
+    if locked:
+        return False
+    await show_password_prompt(
+        chat_id=message.chat.id,
+        user_id=user_id,
+        text=f"Пароль неверный (осталось {remaining_after_try} попыток):",
+    )
+    return False
 
 
 async def get_bot_username() -> str:
@@ -135,18 +333,16 @@ def build_start_keyboard(bot_username: str) -> InlineKeyboardMarkup:
 
 @dp.message(CommandStart())
 async def handle_start(message: Message) -> None:
-    bot_username = await get_bot_username()
-    keyboard = build_start_keyboard(bot_username)
-    await message.answer(
-        "Привет, это бот который голосовые сообщения переводит в текстовый вариант.\n"
-        "Просто перешли любое голосовое сообщение, например от друга, и я его расшифрую!\n"
-        "Меня также можно добавить в группы!",
-        reply_markup=keyboard,
-    )
+    if not await ensure_user_access(message):
+        return
+    await send_welcome_message(message.chat.id)
 
 
 @dp.message(F.voice)
 async def handle_voice(message: Message) -> None:
+    if not await ensure_user_access(message):
+        return
+
     if message.chat.type in {"group", "supergroup"}:
         status_message = await message.reply("Генерирую расшифровку...")
         await transcribe_and_send(
@@ -187,9 +383,9 @@ async def summarize_text(text: str) -> tuple[str, bool]:
         )
         choice = (completion.choices[0].message.content or "").strip()
         return (choice or "Текст не распознан."), True
-    except OpenAIError as exc: 
+    except OpenAIError as exc:
         logger.warning("OpenAI summary failed, fallback to local: %s", exc)
-    except Exception as exc: 
+    except Exception as exc:
         logger.warning("Unexpected OpenAI error, fallback to local: %s", exc)
 
     sentences: list[str] = []
@@ -239,6 +435,20 @@ async def transcribe_and_send(file_id: str, status_message: Message, mode: str) 
 
 @dp.callback_query(F.data.startswith("tr:"))
 async def handle_choice(callback: CallbackQuery) -> None:
+    if callback.message and callback.message.chat.type in {"group", "supergroup"} and not WORK_GROUP:
+        return
+
+    user = callback.from_user
+    if not user:
+        return
+
+    if PASSWORD_ENABLED:
+        is_authorized, is_locked, _ = await get_user_status(user.id)
+        if not is_authorized:
+            if not is_locked and callback.message and callback.message.chat.type == "private":
+                await callback.answer("Сначала введите пароль.", show_alert=True)
+            return
+
     await callback.answer()
 
     try:
@@ -263,6 +473,14 @@ async def handle_choice(callback: CallbackQuery) -> None:
         status_message=status_message,
         mode=mode,
     )
+
+
+@dp.message()
+async def handle_other_messages(message: Message) -> None:
+    if not await ensure_user_access(message):
+        return
+    if message.chat.type == "private":
+        await message.reply("Отправь голосовое сообщение.")
 
 
 async def main() -> None:

@@ -18,6 +18,7 @@ build/
 
 .env
 .env.local
+auth_users.json
 
 .vscode/
 .idea/
