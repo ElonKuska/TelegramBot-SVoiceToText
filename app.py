@@ -42,7 +42,7 @@ PASSWORD_MAX_ATTEMPTS = 5
 PASSWORD_LOCK_SECONDS = 24 * 60 * 60
 AUTH_DB_PATH = Path(os.getenv("AUTH_DB_PATH", "auth_users.json"))
 openai_client: AsyncOpenAI | None = None
-SUMMARY_AI_PROMPT = (
+OPENAI_PROMPT = (
     "Кратко перескажи суть голосового сообщения без ограничений по количеству предложений. "
     "Убери повторы, эмоции и разговорную воду. Пиши ясно и по делу."
 )
@@ -370,7 +370,7 @@ async def summarize_text(text: str) -> tuple[str, bool]:
         return "Текст не распознан.", False
 
     try:
-        user_content = f"{SUMMARY_AI_PROMPT}\n\nРасшифровка:\n{cleaned}"
+        user_content = f"{OPENAI_PROMPT}\n\nРасшифровка:\n{cleaned}"
 
         completion = await get_openai_client().chat.completions.create(
             model=OPENAI_MODEL,
@@ -412,7 +412,7 @@ async def transcribe_and_send(file_id: str, status_message: Message, mode: str) 
 
             await download_voice_file(file_id, ogg_path)
             convert_to_wav(ogg_path, wav_path)
-            transcribe_prompt = SUMMARY_AI_PROMPT if mode == "summary" else None
+            transcribe_prompt = OPENAI_PROMPT if mode == "summary" else None
             transcript = await transcribe_audio(wav_path, prompt=transcribe_prompt)
 
         transcript = transcript or "Текст не распознан."
